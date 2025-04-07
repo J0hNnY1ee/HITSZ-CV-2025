@@ -45,8 +45,8 @@ def complicated_matrix_function(M, a, b):
     """
     out = None
     ### YOUR CODE HERE
-    aTb = np.dot(a.T, b)
-    Ma = np.dot(M, a)
+    aTb = np.matmul(a.T, b)
+    Ma = np.matmul(M, a)
     out = aTb * Ma
     ### END YOUR CODE
 
