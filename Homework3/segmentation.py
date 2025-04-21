@@ -66,16 +66,12 @@ def kmeans_color(image, k, num_iters=500):
     Returns:
         assignments - Cluster assignments for each pixel, reshaped to (H, W).
     """
-    # Step 1: Get image dimensions
     H, W, _ = image.shape
     
-    # Step 2: Flatten the image to (N, 3), where N = H * W
     pixels = image.reshape(-1, 3).astype(np.float32)
     
-    # Step 3: Apply K-Means clustering
     assignments = kmeans(pixels, k, num_iters=num_iters)
     
-    # Step 4: Reshape assignments back to (H, W)
     assignments = assignments.reshape(H, W)
     
     return assignments
@@ -86,49 +82,63 @@ def kmeans_color(image, k, num_iters=500):
 
 #找每个点最后会收敛到的地方（peak）
 def findpeak(data, idx, r):
-    t = 0.01
-    shift = np.array([1])
-    data_point = data[:, idx]
-    dataT = data.T
-    data_pointT = data_point.T
-    data_pointT = data_pointT.reshape(1, 3)
+    t = 0.01  # 设置收敛阈值
+    shift = np.array([1])  # 初始化 shift 值
+    data_point = data[:, idx]  # 当前点的坐标
+    dataT = data.T  # 转置数据以便处理
+    data_pointT = data_point.T  # 当前点的转置
+    data_pointT = data_pointT.reshape(1, 3)  # 将当前点 reshape 为 [1, 维度]
 
     # Runs until the shift is smaller than the set threshold
     while shift.all() > t:
-        # 计算当前点和所有点之间的距离
-        # 并筛选出在半径r内的点，计算mean vector（这里是最简单的均值，也可尝试高斯加权）
-        # 用新的center（peak）更新当前点，直到满足要求跳出循环
-        ### YOUR CODE HERE
-        pass
-        ### END YOUR CODE
+        distances = np.linalg.norm(dataT - data_point, axis=1)
+        
+        neighbors = dataT[distances <= r]
+        
+        new_center = np.mean(neighbors, axis=0)
+        
+        shift = np.linalg.norm(new_center - data_point)
+        
+        data_point = new_center
 
-    return data_pointT.T
-
+    return data_point.reshape(-1, 1)  # 返回最终收敛的峰值点
 
 # Mean shift algorithm
 # 可以改写代码，鼓励自己的想法，但请保证输入输出与notebook一致
 def meanshift(data, r):
-    labels = np.zeros(len(data.T))
-    peaks = [] #聚集的类中心
-    label_no = 1 #当前label
-    labels[0] = label_no
+    labels = np.zeros(len(data.T))  # 初始化标签数组
+    peaks = []  # 聚类中心列表
+    label_no = 1  # 当前类别编号
+    labels[0] = label_no  # 第一个点默认属于第一个类别
 
-    # findpeak is called for the first index out of the loop
+    # 对第一个点调用 findpeak，找到其峰值
     peak = findpeak(data, 0, r)
-    peakT = np.concatenate(peak, axis=0).T
-    peaks.append(peakT)
+    peaks.append(peak)  # 将峰值加入聚类中心列表
 
-    # Every data point is iterated through
-    for idx in range(0, len(data.T)):
-        # 遍历数据，寻找当前点的peak
-        # 并实时关注当前peak是否会收敛到一个新的聚类（和已有peaks比较）
-        # 若是，更新label_no，peaks，labels，继续
-        # 若不是，当前点就属于已有类，继续
-        ### YOUR CODE HERE
-        pass
-        ### END YOUR CODE
-    #print(set(labels))
-    return labels, np.array(peaks).T
+    # 遍历每个数据点
+    for idx in range(1, len(data.T)):
+        # 调用 findpeak 找到当前点的峰值
+        current_peak = findpeak(data, idx, r)
+
+        # 检查当前峰值是否与已有峰值匹配
+        is_new_peak = True
+        for i, existing_peak in enumerate(peaks):
+            # 如果当前峰值与已有峰值的距离小于阈值，则认为它们属于同一个类
+            if np.linalg.norm(current_peak - existing_peak) < 0.01:  # 使用固定阈值
+                labels[idx] = i + 1  # 当前点属于已有类别
+                is_new_peak = False
+                break
+
+        # 如果当前峰值是一个新的峰值，则创建一个新的类别
+        if is_new_peak:
+            peaks.append(current_peak)  # 添加新峰值到聚类中心列表
+            labels[idx] = label_no  # 当前点属于新类别
+            label_no += 1  # 类别编号递增
+
+    # 将 peaks 转换为 NumPy 数组并转置为 [维度, 类别数]
+    peaks = np.concatenate(peaks, axis=1)
+
+    return labels, peaks
 
 
 # image segmentation
@@ -160,6 +170,8 @@ def segmIm(img, r):
     res_img=color.lab2rgb(segmented_image)
     res_img=color.rgb2gray(res_img)
     return res_img
+
+
 def segmIm_parallel(img, r):
     from joblib import Parallel, delayed
     """
@@ -206,7 +218,7 @@ def segmIm_parallel(img, r):
     return res_img
 
 ### Quantitative Evaluation
-def compute_accuracy(mask_gt, mask):
+def compute_accuracy( mask,mask_gt,):
     """ Compute the pixel-wise accuracy of a foreground-background segmentation
         given a ground truth segmentation.
 
@@ -221,15 +233,9 @@ def compute_accuracy(mask_gt, mask):
         accuracy - The fraction of pixels where mask_gt and mask agree. A
             bigger number is better, where 1.0 indicates a perfect segmentation.
     """
-    
-    if mask_gt.shape != mask.shape:
-        raise ValueError("mask_gt and mask must have the same shape.")
-    
-    correct_pixels = (mask_gt == mask).sum()  # 逻辑比较后求和
-    
-
-    total_pixels = mask_gt.size  # 总像素数是数组的大小
-    
+        
+    correct_pixels = (mask_gt == mask).sum() if (mask_gt==mask).sum() > (mask_gt != mask).sum() else (mask_gt != mask).sum()
+    total_pixels = mask_gt.size
     accuracy = correct_pixels / total_pixels
     
     return accuracy
