@@ -1,3 +1,5 @@
 CamVid
 __pycache__
 *.pth
+data_voc
+saved_models

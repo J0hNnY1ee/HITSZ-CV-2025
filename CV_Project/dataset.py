@@ -1,191 +1,226 @@
 # dataset.py
 
-import os
-import pandas as pd
+import torch
+import torchvision.transforms as T
+from torchvision.datasets import VOCSegmentation
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import numpy as np
-import torch
-from torch.utils.data import Dataset
-from torchvision import transforms as T
+import os
 
-import config # 导入配置
+# --------------------------------------------------------------------------------
+# 0. 定义一些常量和辅助数据
+# --------------------------------------------------------------------------------
 
-def get_class_rgb_values():
-    """
-    从class_dict.csv读取类别名称和RGB值.
-    Returns:
-        tuple: (rgb_values, class_names)
-               rgb_values (list): 包含每个类别RGB值 [r,g,b] 的列表.
-               class_names (list): 包含每个类别名称的列表.
-    """
-    try:
-        class_df = pd.read_csv(config.CLASS_CSV_PATH)
-        # 确保r, g, b列是整数类型
-        class_df[['r', 'g', 'b']] = class_df[['r', 'g', 'b']].astype(int)
-        rgb_values = class_df[['r', 'g', 'b']].values.tolist()
-        class_names = class_df['name'].tolist()
-        return rgb_values, class_names
-    except FileNotFoundError:
-        print(f"错误: 类别定义文件 {config.CLASS_CSV_PATH} 未找到!")
-        return [], [] # 返回空列表以避免后续错误，但应在主脚本中处理
-    except Exception as e:
-        print(f"读取类别定义文件时发生错误: {e}")
-        return [], []
+NUM_CLASSES = 21  # 20 物体类别 + 1 背景
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
 
+# (R, G, B) for PASCAL VOC
+VOC_COLORMAP = [
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128],
+    [128, 0, 128], [0, 128, 128], [128, 128, 128], [64, 0, 0], [192, 0, 0],
+    [64, 128, 0], [192, 128, 0], [64, 0, 128], [192, 0, 128],
+    [64, 128, 128], [192, 128, 128], [0, 64, 0], [128, 64, 0],
+    [0, 192, 0], [128, 192, 0], [0, 64, 128]
+]
+VOC_CLASSES = [
+    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus",
+    "car", "cat", "chair", "cow", "diningtable", "dog", "horse",
+    "motorbike", "person", "potted plant", "sheep", "sofa", "train",
+    "tv/monitor"
+]
 
-class CamVidDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, class_rgb_values=None, transform=None, mask_transform=None):
-        """
-        Args:
-            image_dir (string): 图像文件目录路径.
-            mask_dir (string): 标签掩码文件目录路径.
-            class_rgb_values (list): 包含每个类别RGB值的列表. 如果为None, 会尝试从文件加载.
-            transform (callable, optional): 应用于样本图像的可选转换.
-            mask_transform (callable, optional): 应用于样本掩码的RGB PIL图像的可选尺寸调整转换.
-        """
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.transform = transform
-        self.mask_transform = mask_transform # 用于调整RGB掩码的PIL Image
+# ImageNet 均值和标准差
+normalize_mean = [0.485, 0.456, 0.406]
+normalize_std = [0.229, 0.224, 0.225]
 
-        if class_rgb_values is None:
-            print("警告: CamVidDataset 未提供 class_rgb_values, 尝试从文件加载...")
-            loaded_rgb_values, _ = get_class_rgb_values()
-            if not loaded_rgb_values:
-                raise ValueError("无法加载类别RGB值，且未在初始化时提供。")
-            self.class_rgb_values = loaded_rgb_values
-        else:
-            self.class_rgb_values = class_rgb_values
+# --------------------------------------------------------------------------------
+# 1. 定义数据转换
+# --------------------------------------------------------------------------------
 
-        self.images = sorted([f for f in os.listdir(image_dir) if os.path.isfile(os.path.join(image_dir, f))])
-        # 假设掩码文件名与图像文件名相同 (或可以通过某种方式匹配)
-        # 为简单起见，我们这里直接使用与图像列表相同的排序，但实际应用中需要确保它们一一对应
-        self.masks_filenames = sorted([f for f in os.listdir(mask_dir) if os.path.isfile(os.path.join(mask_dir, f))])
+def get_transform_image(img_height=IMG_HEIGHT, img_width=IMG_WIDTH):
+    return T.Compose([
+        T.Resize((img_height, img_width)),
+        T.ToTensor(),
+        T.Normalize(mean=normalize_mean, std=normalize_std)
+    ])
 
-        if len(self.images) != len(self.masks_filenames):
-            print(f"警告: 图像数量 ({len(self.images)}) 与掩码数量 ({len(self.masks_filenames)}) 不匹配。")
-            # 你可能需要更复杂的逻辑来匹配图像和掩码
-            # 例如，如果文件名相似但有不同后缀
+def get_transform_mask(img_height=IMG_HEIGHT, img_width=IMG_WIDTH):
+    return T.Compose([
+        T.Resize((img_height, img_width), interpolation=T.InterpolationMode.NEAREST),
+        T.Lambda(lambda x: torch.tensor(np.array(x), dtype=torch.long))
+    ])
 
-        # 创建从RGB到类别索引的映射
-        self.rgb_to_idx = {tuple(rgb): idx for idx, rgb in enumerate(self.class_rgb_values)}
+# --------------------------------------------------------------------------------
+# 2. 自定义 Dataset 类
+# --------------------------------------------------------------------------------
+
+class PascalVOCDataset(Dataset):
+    def __init__(self, root, image_set='train', download=False, 
+                 img_height=IMG_HEIGHT, img_width=IMG_WIDTH,
+                 transform_img=None, transform_msk=None):
+        self.voc_dataset = VOCSegmentation(root=root, year='2012', image_set=image_set, download=download)
+        
+        self.transform_img = transform_img if transform_img else get_transform_image(img_height, img_width)
+        self.transform_msk = transform_msk if transform_msk else get_transform_mask(img_height, img_width)
+        
+        # 进一步处理掩码中的边界值 (255)
+        # PASCAL VOC 掩码中的边界像素值为255。
+        # 我们通常将其视为背景(0)或在损失函数中通过 ignore_index 忽略。
+        # 这里我们选择将其映射到0 (背景类别)，这样我们的类别索引就是 0 到 NUM_CLASSES-1。
+        # 如果损失函数设置了 ignore_index=255，则无需此步骤。
+        # 但为了统一，这里处理掉。
+        self.map_255_to_0 = True 
+        # 或者，如果你想在损失函数中忽略255 (例如，如果某些模型或损失函数默认处理255)
+        # self.ignore_index = 255 
+        # self.map_255_to_0 = False
 
     def __len__(self):
-        return len(self.images) # 以图像数量为准
-
-    def _rgb_to_idx_numpy(self, rgb_mask_pil):
-        """将RGB PIL Image掩码转换为类别索引的numpy数组"""
-        rgb_mask_np = np.array(rgb_mask_pil) # (H, W, C)
-        idx_mask_np = np.zeros((rgb_mask_np.shape[0], rgb_mask_np.shape[1]), dtype=np.uint8) # uint8因为类别数 < 256
-
-        for rgb_val, class_idx in self.rgb_to_idx.items():
-            matches = np.all(rgb_mask_np == np.array(rgb_val), axis=-1)
-            idx_mask_np[matches] = class_idx
-        return idx_mask_np
+        return len(self.voc_dataset)
 
     def __getitem__(self, idx):
-        if idx >= len(self.images) or idx >= len(self.masks_filenames):
-             print(f"索引 {idx} 超出范围。图像数: {len(self.images)}, 掩码文件名数: {len(self.masks_filenames)}")
-             return None, None
+        img, mask_pil = self.voc_dataset[idx] # img 和 mask_pil 都是 PIL Image
 
-        img_name = os.path.join(self.image_dir, self.images[idx])
-        # 假设掩码文件名与图像文件名相同，或者可以通过images[idx]推断出来
-        # 例如，如果掩码文件名是 image_name_mask.png，而图像是 image_name.png
-        # 这里简单假设它们按顺序一一对应，且文件名相同（常见于CamVid）
-        mask_filename = self.images[idx] # 直接使用图像文件名，因为CamVid通常是这样
-        mask_path = os.path.join(self.mask_dir, mask_filename[:-4] + '_L.png') 
+        img_tensor = self.transform_img(img)
+        mask_tensor = self.transform_msk(mask_pil)
+            
+        if self.map_255_to_0:
+            mask_tensor[mask_tensor == 255] = 0 # 将边界 (255) 映射到背景 (0)
+            
+        return img_tensor, mask_tensor
 
-        try:
-            image = Image.open(img_name).convert("RGB")
-            mask_pil_rgb = Image.open(mask_path).convert("RGB")
-        except FileNotFoundError:
-            print(f"错误: 文件未找到。图像: {img_name} 或 掩码: {mask_path}")
-            return None, None # Dataloader collate_fn 需要处理这个
+# --------------------------------------------------------------------------------
+# 3. 获取 DataLoaders 的辅助函数
+# --------------------------------------------------------------------------------
 
-        # 1. 对原始RGB掩码PIL图像应用尺寸变换 (如果定义了)
-        if self.mask_transform:
-            mask_pil_rgb_resized = self.mask_transform(mask_pil_rgb)
-        else:
-            mask_pil_rgb_resized = mask_pil_rgb # 如果没有变换，直接使用
+def get_dataloaders(data_root='./data', batch_size=8, num_workers=2, 
+                    img_height=IMG_HEIGHT, img_width=IMG_WIDTH, download_data=True):
+    """
+    准备 PASCAL VOC 2012 的训练和验证 DataLoader。
+    """
+    os.makedirs(data_root, exist_ok=True)
 
-        # 2. 将调整尺寸后的RGB PIL掩码转换为 NumPy 索引掩码
-        idx_mask_numpy = self._rgb_to_idx_numpy(mask_pil_rgb_resized) # (H_resized, W_resized) dtype=uint8
+    try:
+        train_dataset = PascalVOCDataset(root=data_root, image_set='train', download=download_data,
+                                         img_height=img_height, img_width=img_width)
+        val_dataset = PascalVOCDataset(root=data_root, image_set='val', download=download_data,
+                                       img_height=img_height, img_width=img_width)
+        
+        print(f"Successfully loaded datasets.")
+        print(f"Training dataset size: {len(train_dataset)}")
+        print(f"Validation dataset size: {len(val_dataset)}")
 
-        # 3. 将NumPy索引掩码转换为LongTensor (torch.int64)
-        idx_mask_tensor = torch.from_numpy(idx_mask_numpy).long()
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                  num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                                num_workers=num_workers, pin_memory=True)
+        
+        print(f"DataLoaders created with batch size: {batch_size}")
+        return train_loader, val_loader
 
-        # 4. 对原始图像应用变换
-        if self.transform:
-            image_tensor = self.transform(image)
-        else: # 如果没有图像变换，至少需要转为Tensor
-            image_tensor = T.ToTensor()(image)
+    except RuntimeError as e:
+        print(f"Error loading dataset or creating DataLoaders: {e}")
+        print("Please ensure you have a stable internet connection or the dataset is already downloaded and correctly placed.")
+        print("If you are on a restricted network, you might need to download the dataset manually from:")
+        print("http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar")
+        print("And place it in the 'data' directory (or the specified data_root), then extract it.")
+        return None, None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None, None
 
-
-        return image_tensor, idx_mask_tensor
-
-
-# 定义数据转换
-image_transforms = T.Compose([
-    T.Resize((config.IMAGE_HEIGHT, config.IMAGE_WIDTH)),
-    T.ToTensor(), # 将PIL Image [0,255] 转为 FloatTensor [0,1]
-    T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # ImageNet 均值和标准差
-])
-
-# 对于掩码：只需要调整大小。Resize的插值方法对掩码很重要，通常用NEAREST
-# 这个变换作用于原始的RGB掩码PIL图像，返回调整大小后的RGB掩码PIL图像
-mask_transforms_for_resize = T.Compose([
-    T.Resize((config.IMAGE_HEIGHT, config.IMAGE_WIDTH), interpolation=T.InterpolationMode.NEAREST),
-])
-
-
-if __name__ == '__main__':
-    print("测试 CamVidDataset 和 get_class_rgb_values...")
+# --------------------------------------------------------------------------------
+# 4. 可视化辅助函数 (可以保留在这里，方便在其他地方调用)
+# --------------------------------------------------------------------------------
+def denormalize(tensor, mean=normalize_mean, std=normalize_std):
+    # 确保 mean 和 std 是 tensor 并且形状正确
+    if not isinstance(mean, torch.Tensor):
+        mean = torch.tensor(mean)
+    if not isinstance(std, torch.Tensor):
+        std = torch.tensor(std)
     
-    # 测试 get_class_rgb_values
-    rgb_values_test, class_names_test = get_class_rgb_values()
-    if not rgb_values_test:
-        print("无法加载类别信息，测试中止。")
+    # 调整形状以进行广播
+    if tensor.ndim == 4: # Batch of images [B, C, H, W]
+        mean = mean.view(1, -1, 1, 1).to(tensor.device)
+        std = std.view(1, -1, 1, 1).to(tensor.device)
+    elif tensor.ndim == 3: # Single image [C, H, W]
+        mean = mean.view(-1, 1, 1).to(tensor.device)
+        std = std.view(-1, 1, 1).to(tensor.device)
     else:
-        print(f"共 {len(class_names_test)} 个类别: {class_names_test[:5]}...") # 打印前5个
-        print(f"RGB值示例 (第一个类别): {rgb_values_test[0] if rgb_values_test else 'N/A'}")
+        raise ValueError("Input tensor must have 3 or 4 dimensions")
+        
+    return tensor * std + mean
 
-        # 测试 CamVidDataset
-        print("\n初始化 CamVidDataset...")
-        # 确保 DATA_DIR/train 和 DATA_DIR/train_labels 存在且有内容
-        # 为了测试，可以创建一个小的子集
-        train_image_dir = os.path.join(config.DATA_DIR, 'train')
-        train_mask_dir = os.path.join(config.DATA_DIR, 'train_labels')
+def tensor_to_pil(tensor_image, mean=normalize_mean, std=normalize_std):
+    """将归一化后的图像Tensor转换为PIL Image (用于显示)"""
+    if tensor_image.ndim == 4: # 如果是 [B, C, H, W]，取第一张
+        tensor_image = tensor_image[0]
+    
+    denorm_image = denormalize(tensor_image.cpu(), mean, std)
+    pil_image = T.ToPILImage()(denorm_image.clamp(0, 1)) # clamp确保值在[0,1]
+    return pil_image
 
-        if not os.path.exists(train_image_dir) or not os.path.exists(train_mask_dir):
-            print(f"错误: 训练数据目录 {train_image_dir} 或 {train_mask_dir} 未找到。请检查 config.DATA_DIR。")
-        else:
-            train_dataset = CamVidDataset(
-                image_dir=train_image_dir,
-                mask_dir=train_mask_dir,
-                class_rgb_values=rgb_values_test, # 使用上面加载的
-                transform=image_transforms,
-                mask_transform=mask_transforms_for_resize
-            )
+def mask_to_pil_color(mask_tensor, colormap=VOC_COLORMAP):
+    """将类别索引的mask Tensor转换为彩色的PIL Image"""
+    if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1: # [1, H, W] -> [H, W]
+        mask_tensor = mask_tensor.squeeze(0)
+    
+    if mask_tensor.ndim != 2:
+        raise ValueError(f"Mask tensor must be 2D (H, W) or 3D (1, H, W), got {mask_tensor.shape}")
 
-            if len(train_dataset) > 0:
-                print(f"数据集大小: {len(train_dataset)}")
-                # 尝试获取第一个有效样本
-                sample_idx = 0
-                item = None
-                # 循环查找有效样本，因为某些文件可能丢失
-                while sample_idx < len(train_dataset):
-                    item = train_dataset[sample_idx]
-                    if item is not None and item[0] is not None:
-                        break
-                    sample_idx += 1
-                
-                if item is not None and item[0] is not None:
-                    img, mask = item
-                    print(f"成功获取样本 {sample_idx}:")
-                    print(f"  图像尺寸: {img.shape}, 类型: {img.dtype}")
-                    print(f"  掩码尺寸: {mask.shape}, 类型: {mask.dtype}")
-                    print(f"  掩码唯一值: {torch.unique(mask)}")
-                else:
-                    print("无法从数据集中获取有效样本进行测试。检查文件是否存在或是否所有文件都已正确处理。")
-            else:
-                print("训练数据集为空或无法加载。")
+    mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
+    colored_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+    
+    for r in range(mask_np.shape[0]):
+        for c in range(mask_np.shape[1]):
+            class_idx = mask_np[r, c]
+            if class_idx < len(colormap):
+                colored_mask[r, c, :] = colormap[class_idx]
+            # elif class_idx == 255 and 0 < len(colormap): # 如果255被映射到了背景
+            #     colored_mask[r, c, :] = colormap[0] 
+    
+    return Image.fromarray(colored_mask)
+
+
+# --------------------------------------------------------------------------------
+# 5. (可选) 主程序块，用于测试 dataset.py 是否能独立运行并加载数据
+# --------------------------------------------------------------------------------
+if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+
+    print("Testing dataset.py...")
+    
+    # 测试获取 dataloaders
+    train_loader, val_loader = get_dataloaders(batch_size=4, download_data=True)
+
+    if train_loader and val_loader:
+        print("\nVisualizing a sample from training data using matplotlib...")
+        try:
+            sample_images, sample_masks = next(iter(train_loader))
+            
+            idx_to_show = 0
+            img_to_show_pil = tensor_to_pil(sample_images[idx_to_show])
+            mask_to_show_pil = mask_to_pil_color(sample_masks[idx_to_show])
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            axes[0].imshow(img_to_show_pil)
+            axes[0].set_title(f"Sample Image (Index {idx_to_show})")
+            axes[0].axis('off')
+
+            axes[1].imshow(mask_to_show_pil)
+            axes[1].set_title(f"Sample Mask (Index {idx_to_show})")
+            axes[1].axis('off')
+            
+            plt.tight_layout()
+            plt.show()
+
+            print(f"Image tensor shape: {sample_images[idx_to_show].shape}")
+            print(f"Mask tensor shape: {sample_masks[idx_to_show].shape}")
+            print(f"Mask tensor dtype: {sample_masks[idx_to_show].dtype}")
+            print(f"Unique values in displayed mask: {torch.unique(sample_masks[idx_to_show])}")
+
+        except Exception as e:
+            print(f"Error during visualization test: {e}")
+    else:
+        print("Could not test visualization as DataLoaders were not created.")
