@@ -1,6 +1,27 @@
+# requirements.txt
+
+# 核心深度学习框架
 torch
 torchvision
+# torchaudio # 如果你的torchvision安装包含了它，可以加上，但我们项目中没直接用
+
+# 数据处理与科学计算
 numpy
-matplotlib
+
+# 图像处理
+Pillow # PIL 的现代分支，通常写作 Pillow
+
+# 命令行参数解析 (Python标准库，通常不需要显式列出，但为了完整性)
+# argparse # (Python >= 3.2)
+
+# 进度条
 tqdm
-Pillow 
+
+# 可视化 (可选，如果使用测试代码中的可视化或自己添加)
+matplotlib
+
+# TensorBoard (可选，如果使用 --use_tensorboard)
+tensorboard 
+
+# (如果你的CSV读取更复杂，可能需要 pandas，但目前用的是内置的csv模块)
+pandas
