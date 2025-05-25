@@ -2,224 +2,166 @@
 
 import os
 import random
-import json # 用于保存字典
+import json
 import numpy as np
 import torch
 from PIL import Image
+import matplotlib.pyplot as plt # 新增导入
 
 # ==============================================================================
 # 随机种子设置
 # ==============================================================================
 def set_seed(seed: int = 42):
-    """
-    设置随机种子以确保实验的可复现性。
-
-    参数:
-        seed (int): 要设置的随机种子。
-    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-    # 下面两行通常用于更严格的可复现性，但可能会降低性能
-    # torch.backends.cudnn.benchmark = False
-    # torch.backends.cudnn.deterministic = True
+        torch.cuda.manual_seed_all(seed)
     print(f"随机种子已设置为: {seed}")
 
-
 # ==============================================================================
-# 检查点管理
+# 检查点管理 (与之前版本相同)
 # ==============================================================================
 def save_checkpoint(state: dict, is_best: bool, experiment_dir: str, filename_prefix: str = "ckpt"):
-    """
-    保存模型检查点到指定的实验目录。
-
-    参数:
-        state (dict): 包含模型状态和其他信息的字典 (例如 epoch, optimizer state, best_metric_val)。
-        is_best (bool): 当前模型是否是验证集上表现最好的模型。
-        experiment_dir (str): 保存检查点的实验根目录 (例如 "experiments_output/my_run_timestamp/").
-        filename_prefix (str): 检查点文件名的前缀。
-    """
-    # 确保实验目录存在 (通常在main.py中已创建，这里作为双重检查)
     if not os.path.exists(experiment_dir):
         print(f"警告: 实验目录 {experiment_dir} 不存在，正在创建...")
         os.makedirs(experiment_dir, exist_ok=True)
-
-    # 最新检查点路径
     filepath = os.path.join(experiment_dir, f"{filename_prefix}_latest.pth.tar")
     torch.save(state, filepath)
-    # 详细的保存信息通常由调用者（如Trainer）记录到日志
-
     if is_best:
         best_filepath = os.path.join(experiment_dir, f"{filename_prefix}_best.pth.tar")
         torch.save(state, best_filepath)
-        # 详细的保存信息通常由调用者（如Trainer）记录到日志
 
 def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer = None,
-                    scheduler: torch.optim.lr_scheduler._LRScheduler = None, device: torch.device = None,weights_only: bool = False):
-    """
-    加载模型检查点。
-
-    参数:
-        checkpoint_path (str): 检查点文件的路径。
-        model (torch.nn.Module): 要加载状态的模型。
-        optimizer (torch.optim.Optimizer, optional): 要加载状态的优化器。
-        scheduler (torch.optim.lr_scheduler._LRScheduler, optional): 要加载状态的学习率调度器。
-        device (torch.device, optional): 指定加载到的设备，如果为None，则使用模型当前的设备。
-        weights_only (bool): torch.load 的 weights_only 参数。默认为 False 以兼容旧检查点。
-    返回:
-        int: 检查点保存时的 epoch 数 (如果可用)。
-        float: 检查点保存时的最佳验证指标 (如果可用)。
-    """
+                    scheduler: torch.optim.lr_scheduler._LRScheduler = None, device: torch.device = None,
+                    weights_only: bool = False):
     if not os.path.exists(checkpoint_path):
         print(f"警告: 检查点文件 {checkpoint_path} 未找到。将从头开始训练。")
-        return 0, float('-inf') # 返回初始epoch和负无穷大的指标
-
-    print(f"正在从 {checkpoint_path} 加载检查点...")
+        return 0, float('-inf')
+    print(f"正在从 {checkpoint_path} 加载检查点 (weights_only={weights_only})...")
     if device is None:
-        # 尝试从模型推断设备，或者默认为CPU
-        try:
-            device = next(model.parameters()).device
-        except StopIteration: # 模型没有参数
-            device = torch.device('cpu')
-
+        try: device = next(model.parameters()).device
+        except StopIteration: device = torch.device('cpu')
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=weights_only)
-    # 加载模型状态
     try:
-        # 兼容旧的保存方式（可能直接保存了model.state_dict()）
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        elif 'state_dict' in checkpoint: # 另一个常见的键名
-             model.load_state_dict(checkpoint['state_dict'])
-        else: # 假设整个文件就是 state_dict
-            model.load_state_dict(checkpoint)
-            print("警告: 检查点似乎只包含模型状态字典，其他信息（如epoch, optimizer）将丢失。")
-            return 0, float('-inf') # 无法恢复 epoch 和 metric
+        if 'model_state_dict' in checkpoint: model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint: model.load_state_dict(checkpoint['state_dict'])
+        else: model.load_state_dict(checkpoint); print("警告: 检查点只含模型状态。"); return 0, float('-inf')
         print("模型状态加载成功。")
     except Exception as e:
-        print(f"加载模型状态字典时出错: {e}。尝试仅加载匹配的层。")
-        # 尝试加载部分匹配的层 (如果模型结构有变动)
-        model_dict = model.state_dict()
-        # 获取源状态字典，处理多种可能的键名
+        print(f"加载模型状态时出错: {e}。尝试部分加载。"); model_dict = model.state_dict()
         source_state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
         if source_state_dict:
             pretrained_dict = {k: v for k, v in source_state_dict.items() if k in model_dict and v.size() == model_dict[k].size()}
-            model_dict.update(pretrained_dict)
-            model.load_state_dict(model_dict) # type: ignore
-            print(f"已加载 {len(pretrained_dict)}/{len(source_state_dict)} 个匹配的层。")
-        else:
-            print("错误：检查点中无法找到模型状态字典。")
-
-
-    # 加载优化器状态
+            model_dict.update(pretrained_dict); model.load_state_dict(model_dict) # type: ignore
+            print(f"已加载 {len(pretrained_dict)}/{len(source_state_dict)} 匹配层。")
+        else: print("错误：检查点中无模型状态字典。")
     if optimizer and 'optimizer_state_dict' in checkpoint:
-        try:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print("优化器状态加载成功。")
-        except Exception as e:
-            print(f"加载优化器状态时出错: {e}。优化器将使用初始状态。")
-    elif optimizer:
-        print("警告: 检查点中未找到优化器状态。优化器将使用初始状态。")
-
-    # 加载学习率调度器状态
+        try: optimizer.load_state_dict(checkpoint['optimizer_state_dict']); print("优化器状态加载成功。")
+        except Exception as e: print(f"加载优化器状态时出错: {e}。")
+    elif optimizer: print("警告: 检查点中无优化器状态。")
     if scheduler and 'scheduler_state_dict' in checkpoint:
-        try:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print("学习率调度器状态加载成功。")
-        except Exception as e:
-            print(f"加载学习率调度器状态时出错: {e}。调度器将使用初始状态。")
-    elif scheduler:
-        print("警告: 检查点中未找到学习率调度器状态。")
-
-
+        try: scheduler.load_state_dict(checkpoint['scheduler_state_dict']); print("学习率调度器状态加载成功。")
+        except Exception as e: print(f"加载学习率调度器状态时出错: {e}。")
+    elif scheduler: print("警告: 检查点中无学习率调度器状态。")
     start_epoch = checkpoint.get('epoch', 0)
     best_metric_val = checkpoint.get('best_metric_val', float('-inf'))
-    metric_name = checkpoint.get('metric_name', 'unknown_metric') # 尝试获取指标名称
-
+    if isinstance(best_metric_val, (np.generic, np.ndarray)): best_metric_val = float(best_metric_val)
+    metric_name = checkpoint.get('metric_name', 'unknown_metric')
     print(f"检查点加载完成。将从 Epoch {start_epoch} 继续，当前最佳 {metric_name}: {best_metric_val:.4f}")
     return start_epoch, best_metric_val
 
-
 # ==============================================================================
-# 掩码可视化 (与 dataset.py 中的类似，但作为通用工具)
+# 掩码可视化 (与之前版本相同)
 # ==============================================================================
 def mask_to_rgb(mask_indices: np.ndarray, label_to_color: dict) -> np.ndarray:
-    """
-    将类别索引掩码转换回RGB图像，用于可视化。
-
-    参数:
-        mask_indices (np.ndarray): 包含类别索引的2D NumPy数组 (H, W)。
-        label_to_color (dict): 类别索引到(R,G,B)元组的映射。
-
-    返回:
-        np.ndarray: RGB格式的3D NumPy数组 (H, W, 3)。
-    """
-    if mask_indices.ndim != 2:
-        raise ValueError(f"mask_indices 必须是2D数组, 得到维度: {mask_indices.ndim}")
-
-    height, width = mask_indices.shape
-    rgb_mask = np.zeros((height, width, 3), dtype=np.uint8)
-
+    if mask_indices.ndim != 2: raise ValueError(f"mask_indices 必须是2D数组, 得到维度: {mask_indices.ndim}")
+    height, width = mask_indices.shape; rgb_mask = np.zeros((height, width, 3), dtype=np.uint8)
     for label_idx, color_tuple in label_to_color.items():
-        if not (isinstance(color_tuple, tuple) and len(color_tuple) == 3):
-            # print(f"警告: utils.mask_to_rgb - 索引 {label_idx} 的颜色值 '{color_tuple}' 不是有效的RGB元组。跳过此颜色。")
-            continue # 保持静默或只在调试时打印
+        if not (isinstance(color_tuple, tuple) and len(color_tuple) == 3): continue
         rgb_mask[mask_indices == label_idx] = color_tuple
     return rgb_mask
 
 def tensor_mask_to_pil_rgb(mask_tensor: torch.Tensor, label_to_color_map: dict) -> Image.Image:
-    """
-    将单通道的类别索引张量 (H, W) 或 (1, H, W) 转换为可显示的PIL RGB图像。
-
-    参数:
-        mask_tensor (torch.Tensor): 类别索引掩码张量 (H,W) 或 (1,H,W)，应为 Long 或 Byte 类型。
-        label_to_color_map (dict): 类别索引到 (R,G,B) 颜色的映射。
-
-    返回:
-        PIL.Image.Image: RGB格式的PIL图像。
-    """
-    if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1:
-        mask_tensor = mask_tensor.squeeze(0)
-    elif mask_tensor.ndim != 2:
-        raise ValueError(f"mask_tensor 期望形状为 (H,W) 或 (1,H,W), 得到 {mask_tensor.shape}")
-
-    mask_np = mask_tensor.cpu().numpy().astype(np.uint8) # 确保是整数类型
-    rgb_array = mask_to_rgb(mask_np, label_to_color_map)
+    if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1: mask_tensor = mask_tensor.squeeze(0)
+    elif mask_tensor.ndim != 2: raise ValueError(f"mask_tensor 期望形状为 (H,W) 或 (1,H,W), 得到 {mask_tensor.shape}")
+    mask_np = mask_tensor.cpu().numpy().astype(np.uint8); rgb_array = mask_to_rgb(mask_np, label_to_color_map)
     return Image.fromarray(rgb_array)
 
 # ==============================================================================
-# 保存字典到JSON文件
+# 保存字典到JSON文件 (与之前版本相同)
 # ==============================================================================
 def save_dict_to_json(data_dict: dict, json_path: str):
+    try:
+        def convert_to_json_serializable(item):
+            if isinstance(item, np.ndarray): return item.tolist()
+            if isinstance(item, torch.Tensor): return item.cpu().tolist()
+            if isinstance(item, (np.float32, np.float64)): return float(item)
+            if isinstance(item, (np.int32, np.int64)): return int(item)
+            return item
+        serializable_dict = {k: convert_to_json_serializable(v) for k, v in data_dict.items()}
+        with open(json_path, 'w') as f: json.dump(serializable_dict, f, indent=4)
+        print(f"字典已保存至: {json_path}")
+    except Exception as e: print(f"保存字典到 {json_path} 时出错: {e}")
+
+# ==============================================================================
+# 新增：绘制和保存训练历史图表
+# ==============================================================================
+def plot_and_save_history(history: dict, save_path_prefix: str, primary_metric_name: str = "mIoU"):
     """
-    将字典保存为JSON文件。
+    绘制训练和验证的损失以及一个主要指标的曲线，并保存为图片。
 
     参数:
-        data_dict (dict): 要保存的字典。
-        json_path (str): JSON文件的保存路径。
+        history (dict): 包含列表的字典，例如:
+                        {
+                            'train_loss': [epoch1_loss, epoch2_loss, ...],
+                            'val_loss': [epoch1_loss, epoch2_loss, ...],
+                            'val_metric': [epoch1_metric, epoch2_metric, ...]
+                        }
+        save_path_prefix (str): 保存图表的文件路径前缀 (不含.png)。
+                               例如 "experiment_dir/training_plots"
+                               会生成 "experiment_dir/training_plots_loss.png" 和
+                                       "experiment_dir/training_plots_metric.png"
+        primary_metric_name (str): history中 'val_metric' 键对应的指标名称，用于图表标题。
     """
+    epochs = range(1, len(history['train_loss']) + 1)
+
+    plt.style.use('seaborn-v0_8-whitegrid') # 使用一个好看的样式
+
+    # --- 绘制损失曲线 ---
     try:
-        # 将 NumPy 数组和张量转换为列表，以便JSON序列化
-        def convert_to_json_serializable(item):
-            if isinstance(item, np.ndarray):
-                return item.tolist()
-            if isinstance(item, torch.Tensor):
-                return item.cpu().tolist()
-            if isinstance(item, (np.float32, np.float64)): # 处理numpy标量
-                return float(item)
-            if isinstance(item, (np.int32, np.int64)): # 处理numpy标量
-                return int(item)
-            return item
-
-        serializable_dict = {k: convert_to_json_serializable(v) for k, v in data_dict.items()}
-
-        with open(json_path, 'w') as f:
-            json.dump(serializable_dict, f, indent=4)
-        print(f"字典已保存至: {json_path}")
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, history['train_loss'], 'bo-', label='Training Loss')
+        plt.plot(epochs, history['val_loss'], 'ro-', label='Validation Loss')
+        plt.title('Training and Validation Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        loss_fig_path = f"{save_path_prefix}_loss.png"
+        plt.savefig(loss_fig_path)
+        plt.close() # 关闭图形，防止在某些后端中累积
+        print(f"训练/验证损失曲线图已保存至: {loss_fig_path}")
     except Exception as e:
-        print(f"保存字典到 {json_path} 时出错: {e}")
+        print(f"绘制损失曲线图时出错: {e}")
+
+    # --- 绘制验证集主要指标曲线 ---
+    if 'val_metric' in history and history['val_metric']:
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.plot(epochs, history['val_metric'], 'go-', label=f'Validation {primary_metric_name}')
+            plt.title(f'Validation {primary_metric_name}')
+            plt.xlabel('Epochs')
+            plt.ylabel(primary_metric_name)
+            plt.legend()
+            plt.grid(True)
+            metric_fig_path = f"{save_path_prefix}_{primary_metric_name.lower().replace(' ', '_')}.png"
+            plt.savefig(metric_fig_path)
+            plt.close()
+            print(f"验证集{primary_metric_name}曲线图已保存至: {metric_fig_path}")
+        except Exception as e:
+            print(f"绘制{primary_metric_name}曲线图时出错: {e}")
 
 
 # ==============================================================================

@@ -51,8 +51,11 @@ class CamVidDataset(Dataset):
     def __init__(self,
                  root_dir: str,
                  image_set: str = 'train',
-                 transform=None,
-                 target_transform=None, # 主要用于尺寸调整PIL Label
+                 transform=None, # 应用于输入图像的转换 (在内部调整尺寸后，如果提供了output_size)
+                                 # 应包括 ToTensor(), Normalize() 等。
+                 target_transform=None, # 应用于PIL标签图像的转换 (在内部调整尺寸后，如果提供了output_size)
+                                        # 例如，用于PIL级别的标签增强。
+                 output_size: tuple[int, int] = None, # 可选：(height, width) 用于内部图像和标签的初始调整尺寸。
                  img_suffix: str = ".png",
                  label_suffix_from_img: str = "_L.png", # 标签文件名相对于图像文件名的后缀
                  class_dict_filename: str = "class_dict.csv", # CSV文件名
@@ -63,9 +66,16 @@ class CamVidDataset(Dataset):
         参数:
             root_dir (str): 数据集的根目录 (例如 "CamVid/")。
             image_set (str): 'train', 'val', 或 'test'，指定加载哪个数据集分割。
-            transform (callable, optional): 应用于输入图像的转换 (例如 ToTensor, Normalize)。
-            target_transform (callable, optional): 应用于PIL标签图像的转换 (通常是Resize)。
+            transform (callable, optional): 应用于输入图像的转换。
+                                           如果提供了 `output_size`，此转换将应用于已调整大小的图像。
+                                           通常应包含 ToTensor() 和 Normalize()。
+            target_transform (callable, optional): 应用于PIL标签图像的转换。
+                                                   如果提供了 `output_size`，此转换将应用于已调整大小的PIL标签。
                                                    注意：最终目标掩码应为 LongTensor 类型。
+            output_size (tuple[int, int], optional): 一个元组 (height, width) 指定图像和标签的输出尺寸。
+                                                     如果提供，图像将使用 BILINEAR 插值调整大小，
+                                                     标签将使用 NEAREST 插值调整大小。此调整在 `transform` 和
+                                                     `target_transform` 之前应用。
             img_suffix (str): 原始图像文件的后缀 (例如 ".png")。
             label_suffix_from_img (str): 标签文件名是在图像文件名(去除img_suffix后)基础上添加的后缀。
             class_dict_filename (str): 类别定义CSV文件的名称 (应位于`root_dir`下)。
@@ -80,6 +90,7 @@ class CamVidDataset(Dataset):
         self.image_set = image_set
         self.transform = transform
         self.target_transform = target_transform
+        self.output_size = output_size # (height, width)
 
         # --- 确定图像和标签文件夹路径 ---
         self.img_folder = os.path.join(root_dir, image_set)
@@ -91,7 +102,6 @@ class CamVidDataset(Dataset):
         if void_class_names is None:
             self.void_class_names = ['void', 'unlabelled', 'ignore', 'background']
         else:
-            # 确保 void_class_names 中的名称是小写的，以便进行不区分大小写的比较
             self.void_class_names = [name.lower() for name in void_class_names]
 
 
@@ -100,16 +110,10 @@ class CamVidDataset(Dataset):
         if not os.path.isdir(self.label_folder):
             raise FileNotFoundError(f"标签文件夹未找到: {self.label_folder}")
 
-        # --- 加载类别定义 ---
-        # self.num_total_classes: CSV中定义的类别总数
-        # self.num_train_classes: 实际用于训练的类别数 (通常是 total - 1 if ignore_index is found)
-        # self.ignore_index: 被识别为忽略类的索引，如果未找到则为 -1
         self.class_names, self.palette, self.label_to_color, \
         self.num_total_classes, self.num_train_classes, self.ignore_index = \
             self._load_class_definitions(root_dir, class_dict_filename)
 
-        # --- 加载图像文件名 ---
-        # 获取图像文件夹下所有以img_suffix结尾的文件
         self.image_filenames = sorted([
             f for f in os.listdir(self.img_folder) if f.endswith(self.img_suffix)
         ])
@@ -121,14 +125,16 @@ class CamVidDataset(Dataset):
         print(f"  图像文件夹: {self.img_folder}")
         print(f"  标签文件夹: {self.label_folder}")
         print(f"  图像数量: {len(self.image_filenames)}")
+        if self.output_size:
+            print(f"  内部调整尺寸至: {self.output_size} (H x W)")
+        else:
+            print(f"  未指定内部调整尺寸 (output_size=None)。尺寸将由外部 transform 控制。")
         print(f"  总类别数 (从CSV): {self.num_total_classes}")
         print(f"  可训练类别数: {self.num_train_classes}")
         ignore_class_name = "N/A"
         if self.ignore_index != -1 and self.ignore_index < len(self.class_names):
             ignore_class_name = f"'{self.class_names[self.ignore_index]}'"
         print(f"  忽略索引: {self.ignore_index} (对应类别: {ignore_class_name})")
-        # print(f"  所有类别名称: {self.class_names}") # 可选打印
-
 
     def _load_class_definitions(self, root_dir, class_dict_filename):
         """ 从 class_dict.csv 加载类别名称、调色板等信息，如果失败则使用默认值。 """
@@ -136,22 +142,19 @@ class CamVidDataset(Dataset):
         
         loaded_class_names = []
         loaded_palette = {}
-        determined_ignore_idx = -1 # 默认为没有特定忽略索引
+        determined_ignore_idx = -1 
         num_total_cls_from_csv = 0
         
         if os.path.exists(csv_path):
             try:
-                with open(csv_path, 'r', newline='', encoding='utf-8-sig') as f: # utf-8-sig to handle BOM
+                with open(csv_path, 'r', newline='', encoding='utf-8-sig') as f: 
                     reader = csv.DictReader(f)
-                    
-                    # 动态获取列名，并转换为小写进行不区分大小写的匹配
                     fieldnames_lower = [field.lower() for field in reader.fieldnames if field]
                     if not all(col in fieldnames_lower for col in ['name', 'r', 'g', 'b']):
                          print(f"警告: {csv_path} 文件缺少 'name', 'r', 'g', 'b' 中的某些列 (不区分大小写)。")
                          print(f"       找到的列: {reader.fieldnames}。将尝试使用默认类别定义。")
                          raise ValueError("CSV文件列不匹配")
 
-                    # 找到实际的列名 (保持原始大小写以便访问row)
                     name_col = reader.fieldnames[fieldnames_lower.index('name')]
                     r_col = reader.fieldnames[fieldnames_lower.index('r')]
                     g_col = reader.fieldnames[fieldnames_lower.index('g')]
@@ -164,25 +167,20 @@ class CamVidDataset(Dataset):
                         except ValueError:
                             print(f"警告: CSV文件 {csv_path} 行 {idx+2} 颜色值无法转换为整数: {row}. 跳过此行.")
                             continue
-                        except TypeError: # 如果颜色值是None或空字符串
+                        except TypeError: 
                             print(f"警告: CSV文件 {csv_path} 行 {idx+2} 颜色值为空: {row}. 跳过此行.")
                             continue
 
-
                         loaded_class_names.append(name_val)
-                        loaded_palette[(r_val, g_val, b_val)] = idx # 类别索引基于CSV中的行顺序
+                        loaded_palette[(r_val, g_val, b_val)] = idx 
                         num_total_cls_from_csv += 1
 
-                        # 检查是否为void/ignore class
                         if name_val.lower() in self.void_class_names:
                             if determined_ignore_idx != -1:
                                 print(f"警告: 在 {csv_path} 中找到多个可能的忽略类别 ('{loaded_class_names[determined_ignore_idx]}' 和 '{name_val}') 基于 void_class_names。将使用第一个找到的。")
                             else:
                                 determined_ignore_idx = idx
-                                # print(f"  找到忽略类别: '{name_val}' (索引: {idx})")
-
-
-                if not loaded_class_names: # 如果CSV为空或所有行都有问题
+                if not loaded_class_names: 
                     raise ValueError("CSV文件中没有成功加载任何类别定义。")
 
                 loaded_label_to_color = {v: k for k, v in loaded_palette.items()}
@@ -193,16 +191,13 @@ class CamVidDataset(Dataset):
                     print(f"警告: 在 {csv_path} 中未根据提供的 void_class_names ('{self.void_class_names}') 找到明确的忽略类别。")
                     print(f"       将假设所有 {num_total_cls_from_csv} 个类别都可训练，并将 ignore_index 设置为 -1。")
                     num_train_cls_final = num_total_cls_from_csv
-                    # determined_ignore_idx 保持为 -1
-
+                
                 print(f"成功从 {csv_path} 加载 {num_total_cls_from_csv} 个类别定义。")
                 return (loaded_class_names, loaded_palette, loaded_label_to_color, 
                         num_total_cls_from_csv, num_train_cls_final, determined_ignore_idx)
-
             except Exception as e:
                 print(f"从 {csv_path} 加载类别定义失败: {e}。将尝试使用内置的默认值。")
         
-        # 如果加载失败或文件不存在，使用默认值
         print("警告: 未找到或无法解析 class_dict.csv，将使用内置的默认CamVid类别和调色板。")
         print("       这可能与您的数据集不完全匹配，请检查 class_dict.csv 文件。")
         return (DEFAULT_CAMVID_CLASS_NAMES, DEFAULT_CAMVID_PALETTE, DEFAULT_CAMVID_LABEL_TO_COLOR,
@@ -219,10 +214,8 @@ class CamVidDataset(Dataset):
         if idx < 0 or idx >= len(self.image_filenames):
             raise IndexError(f"索引 {idx} 超出范围 [0, {len(self.image_filenames)-1}]")
 
-        # --- 构造文件路径 ---
         img_filename = self.image_filenames[idx]
         img_path = os.path.join(self.img_folder, img_filename)
-
         base_name = img_filename[:-len(self.img_suffix)] 
         label_filename = base_name + self.label_suffix_from_img
         label_path = os.path.join(self.label_folder, label_filename)
@@ -232,7 +225,6 @@ class CamVidDataset(Dataset):
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"标签文件未找到: {label_path} (期望基于图像名 {img_filename})")
 
-        # --- 加载图像和标签 ---
         try:
             image_pil = Image.open(img_path).convert('RGB')
             label_pil = Image.open(label_path).convert('RGB') 
@@ -240,22 +232,27 @@ class CamVidDataset(Dataset):
             print(f"加载图像/标签时出错 (索引 {idx}, 文件名: {img_filename}): {e}")
             raise e
 
-        # --- 应用针对PIL标签图像的转换 (例如Resize) ---
+        # 1. 如果提供了 output_size，首先进行内部调整尺寸
+        if self.output_size:
+            # self.output_size is (height, width)
+            # transforms.functional.resize expects size as (h, w)
+            image_pil = transforms.functional.resize(image_pil, self.output_size, 
+                                                     interpolation=transforms.InterpolationMode.BILINEAR)
+            label_pil = transforms.functional.resize(label_pil, self.output_size,
+                                                     interpolation=transforms.InterpolationMode.NEAREST)
+
+        # 2. 应用用户提供的 target_transform (针对 PIL 标签图像)
         if self.target_transform:
             label_pil = self.target_transform(label_pil) 
 
-        # --- 将RGB标签转换为类别索引掩码 ---
-        # 如果 self.ignore_index 是 -1 (表示没有特定忽略类或所有类都训练)，
-        # 那么未匹配的像素会被标记为一个超出 num_total_classes 范围的值，
-        # 这样它们通常会被损失函数或评估逻辑自然忽略。
+        # 3. 将RGB标签转换为类别索引掩码
         fill_value_for_unmatched_pixels = self.ignore_index if self.ignore_index != -1 else self.num_total_classes
-        
         target_mask_np = self._rgb_to_mask(label_pil, self.palette, fill_value_for_unmatched_pixels)
         target_mask_tensor = torch.from_numpy(target_mask_np).long()
 
-        # --- 应用针对图像的转换 (例如Resize, ToTensor, Normalize) ---
+        # 4. 应用用户提供的 transform (针对图像)
         if self.transform:
-            image_tensor = self.transform(image_pil)
+            image_tensor = self.transform(image_pil) # image_pil is potentially resized here
         else:
             # 如果没有提供transform，至少需要转换为Tensor
             image_tensor = transforms.ToTensor()(image_pil)
@@ -263,48 +260,34 @@ class CamVidDataset(Dataset):
         return image_tensor, target_mask_tensor
 
     def _rgb_to_mask(self, rgb_image: Image.Image, palette: dict, fill_value_for_unmatched: int) -> np.ndarray:
-        """
-        将RGB格式的PIL Image标签掩码转换为类别索引的NumPy数组。
-        未匹配palette中任何颜色的像素将被赋予 fill_value_for_unmatched。
-        """
         rgb_array = np.array(rgb_image, dtype=np.uint8)
-        if rgb_array.ndim == 2: # 有些掩码可能是灰度图，直接用作索引
-            # print("警告: 标签图像是灰度图，将直接使用其值作为类别索引。请确保这是期望的行为。")
+        if rgb_array.ndim == 2:
             return rgb_array.astype(np.int64)
         if rgb_array.shape[2] != 3:
             raise ValueError(f"RGB图像应有3个通道，但得到 {rgb_array.shape[2]} 个通道。")
 
         height, width, _ = rgb_array.shape
-        # 用指定的填充值初始化掩码
         mask = np.full((height, width), fill_value_for_unmatched, dtype=np.int64) 
 
         for rgb_tuple, class_index in palette.items():
-            # 找到所有颜色匹配的像素
             matches = np.all(rgb_array == np.array(rgb_tuple, dtype=np.uint8), axis=-1)
             mask[matches] = class_index
         return mask
 
     def _mask_to_rgb(self, mask_indices: np.ndarray) -> np.ndarray:
-        """
-        (辅助函数) 将类别索引掩码转换回RGB图像，主要用于调试或可视化。
-        使用 self.label_to_color 进行映射。
-        """
         height, width = mask_indices.shape
         rgb_mask = np.zeros((height, width, 3), dtype=np.uint8)
-
         for label_idx, color_tuple in self.label_to_color.items():
-            # 只为在CSV中定义的有效类别索引（0 到 num_total_classes-1）上色
             if 0 <= label_idx < self.num_total_classes : 
                  rgb_mask[mask_indices == label_idx] = color_tuple
         return rgb_mask
 
 # ==============================================================================
-# 测试代码 (可选，用于验证Dataset类是否正常工作)
+# 测试代码
 # ==============================================================================
 if __name__ == '__main__':
     print("开始 CamVidDataset (根据CSV动态加载类别) 测试...")
 
-    # !!! 重要: 请将 CAMVID_ROOT_DIR 修改为你本地CamVid数据集的实际路径 !!!
     CAMVID_ROOT_DIR = "path/to/your/CamVid" # 例如: "D:/datasets/CamVid"
     if CAMVID_ROOT_DIR == "path/to/your/CamVid" or not os.path.exists(CAMVID_ROOT_DIR):
         print(f"警告: 请修改 CAMVID_ROOT_DIR ('{CAMVID_ROOT_DIR}') 为你的 CamVid 数据集根目录路径，然后重新运行测试。")
@@ -312,25 +295,86 @@ if __name__ == '__main__':
         exit()
 
     # --- 定义图像和标签预处理 ---
-    IMG_HEIGHT = 256
-    IMG_WIDTH = 384 
+    # 目标输出尺寸 (height, width)
+    # 这些值可以传递给 CamVidDataset 的 output_size 参数，
+    # 或者用于在外部 transforms 中定义 Resize 操作。
+    TARGET_HEIGHT = 256 
+    TARGET_WIDTH = 384
 
-    image_transforms = transforms.Compose([
-        transforms.Resize((IMG_HEIGHT, IMG_WIDTH), interpolation=transforms.InterpolationMode.BILINEAR),
+    # 演示1: 使用 output_size 参数进行内部调整尺寸
+    print(f"\n--- 演示1: 使用 output_size=({TARGET_HEIGHT}, {TARGET_WIDTH}) ---")
+    # 当使用 output_size 时, transform 和 target_transform 通常不需要再包含 Resize
+    # transform 仍然需要 ToTensor 和 Normalize
+    image_transforms_for_output_size = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    target_pil_transforms = transforms.Resize((IMG_HEIGHT, IMG_WIDTH), interpolation=transforms.InterpolationMode.NEAREST)
-
-    print(f"\n正在创建 'train' 数据集实例 (目标尺寸: {IMG_HEIGHT}x{IMG_WIDTH})...")
+    # target_transform 可以为 None，或用于其他 PIL 级别的标签增强 (非Resize)
+    target_pil_transforms_for_output_size = None 
+                                           
     try:
-        # 指定 void_class_names 来匹配你的CSV中的 "Void" 类或其他你认为是忽略的类
+        train_dataset_demo1 = CamVidDataset(
+            root_dir=CAMVID_ROOT_DIR,
+            image_set='train',
+            output_size=(TARGET_HEIGHT, TARGET_WIDTH), # <--- 使用 output_size
+            transform=image_transforms_for_output_size,
+            target_transform=target_pil_transforms_for_output_size,
+            void_class_names=['Void'] 
+        )
+        print(f"\n成功创建 'train' 数据集 (使用 output_size)。")
+        if len(train_dataset_demo1) > 0:
+            img_demo1, mask_demo1 = train_dataset_demo1[0]
+            print(f"  样本图像张量形状: {img_demo1.shape}") # 应为 (C, TARGET_HEIGHT, TARGET_WIDTH)
+            print(f"  样本目标掩码形状: {mask_demo1.shape}") # 应为 (TARGET_HEIGHT, TARGET_WIDTH)
+            assert img_demo1.shape[1:] == mask_demo1.shape, "图像和掩码尺寸不匹配 (Demo 1)"
+            assert img_demo1.shape[1] == TARGET_HEIGHT and img_demo1.shape[2] == TARGET_WIDTH, "图像尺寸不等于output_size (Demo 1)"
+
+    except Exception as e:
+        print(f"演示1时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # 演示2: 不使用 output_size (旧行为), Resize 在外部 transform 中定义
+    print(f"\n--- 演示2: output_size=None (Resize 在外部 transform 中) ---")
+    image_transforms_external_resize = transforms.Compose([
+        transforms.Resize((TARGET_HEIGHT, TARGET_WIDTH), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    target_pil_transforms_external_resize = transforms.Resize((TARGET_HEIGHT, TARGET_WIDTH), 
+                                                              interpolation=transforms.InterpolationMode.NEAREST)
+    try:
+        train_dataset_demo2 = CamVidDataset(
+            root_dir=CAMVID_ROOT_DIR,
+            image_set='train',
+            output_size=None, # <--- 不使用 output_size
+            transform=image_transforms_external_resize,
+            target_transform=target_pil_transforms_external_resize,
+            void_class_names=['Void']
+        )
+        print(f"\n成功创建 'train' 数据集 (output_size=None)。")
+        if len(train_dataset_demo2) > 0:
+            img_demo2, mask_demo2 = train_dataset_demo2[0]
+            print(f"  样本图像张量形状: {img_demo2.shape}")
+            print(f"  样本目标掩码形状: {mask_demo2.shape}")
+            assert img_demo2.shape[1:] == mask_demo2.shape, "图像和掩码尺寸不匹配 (Demo 2)"
+            assert img_demo2.shape[1] == TARGET_HEIGHT and img_demo2.shape[2] == TARGET_WIDTH, "图像尺寸不等于目标尺寸 (Demo 2)"
+    except Exception as e:
+        print(f"演示2时发生错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+    # --- 以下为详细的单个数据集测试和可视化 (使用演示1的配置) ---
+    print(f"\n正在使用 output_size=({TARGET_HEIGHT}, {TARGET_WIDTH}) 配置进行详细测试...")
+    try:
         train_dataset = CamVidDataset(
             root_dir=CAMVID_ROOT_DIR,
             image_set='train',
-            transform=image_transforms,
-            target_transform=target_pil_transforms,
-            void_class_names=['Void'] # 明确告诉它 "Void" 是忽略类
+            output_size=(TARGET_HEIGHT, TARGET_WIDTH),
+            transform=image_transforms_for_output_size, # 使用为 output_size 准备的 transform
+            target_transform=target_pil_transforms_for_output_size,
+            void_class_names=['Void']
         )
 
         print(f"\n成功创建 'train' 数据集。")
@@ -342,40 +386,37 @@ if __name__ == '__main__':
         else:
             print(f"  没有特定的忽略类别被指定为训练时的ignore_index (当前为 {train_dataset.ignore_index})")
 
-
         if len(train_dataset) > 0:
-            sample_idx = 0 #np.random.randint(0, len(train_dataset))
+            sample_idx = 0 
             print(f"\n获取第 {sample_idx} 个样本...")
             image, target_mask = train_dataset[sample_idx]
 
             print(f"  图像张量 (Image Tensor): 类型: {type(image)}, 形状: {image.shape}, 数据类型: {image.dtype}")
             print(f"  目标掩码张量 (Target Mask Tensor): 类型: {type(target_mask)}, 形状: {target_mask.shape}, 数据类型: {target_mask.dtype}")
             unique_labels = torch.unique(target_mask)
-            print(f"  目标掩码唯一值: {unique_labels.tolist()}") # 打印所有唯一值
+            print(f"  目标掩码唯一值: {unique_labels.tolist()}")
 
             assert target_mask.ndim == 2, "目标掩码应为2D (H, W)"
             assert target_mask.dtype == torch.long, "目标掩码数据类型应为 torch.long"
             assert image.shape[1:] == target_mask.shape, \
                    f"图像和掩码的H, W尺寸应一致。图像: {image.shape[1:]}, 掩码: {target_mask.shape}"
+            assert image.shape[1] == TARGET_HEIGHT and image.shape[2] == TARGET_WIDTH, \
+                   f"图像尺寸 ({image.shape[1]}x{image.shape[2]}) 与期望尺寸 ({TARGET_HEIGHT}x{TARGET_WIDTH}) 不符"
 
-            # 检查标签值是否在 [0, num_total_classes - 1] 范围内，或者等于ignore_index (如果ignore_index是有效索引)
-            # 或者等于 fill_value_for_unmatched (如果ignore_index是-1)
+
             max_val_in_mask = torch.max(unique_labels)
             min_val_in_mask = torch.min(unique_labels)
 
-            if train_dataset.ignore_index != -1: # 有明确的忽略索引
-                # 所有值要么小于 num_total_classes, 要么等于 ignore_index (它本身也 < num_total_classes)
+            if train_dataset.ignore_index != -1: 
                 assert max_val_in_mask < train_dataset.num_total_classes, \
                    f"掩码中的最大类别索引 ({max_val_in_mask}) 应小于总类别数 {train_dataset.num_total_classes}。"
-            else: # ignore_index is -1, fill_value_for_unmatched 可能是 num_total_classes
-                 # 此时，有效类别是 [0, num_total_classes-1], 未匹配的是 num_total_classes
+            else: 
                 assert max_val_in_mask <= train_dataset.num_total_classes, \
                     f"掩码中的最大类别索引 ({max_val_in_mask}) 超出预期范围 [0, {train_dataset.num_total_classes}]。"
 
             assert min_val_in_mask >= 0, f"掩码中的最小类别索引 ({min_val_in_mask}) 小于0"
             print("\n样本检查通过！")
 
-            # (可选) 可视化一个样本
             try:
                 import matplotlib.pyplot as plt
                 print("\n尝试可视化样本...")
@@ -396,7 +437,7 @@ if __name__ == '__main__':
                 ax[1].imshow(rgb_mask_display_pil)
                 ax[1].set_title(f"目标掩码 (样本 {sample_idx})")
                 ax[1].axis('off')
-                plt.suptitle(f"CamVid 数据集样本可视化 ({train_dataset.image_set} 集)")
+                plt.suptitle(f"CamVid 数据集样本可视化 ({train_dataset.image_set} 集, 尺寸: {TARGET_HEIGHT}x{TARGET_WIDTH})")
                 plt.tight_layout()
                 plt.show()
                 print("可视化完成。请检查弹出的图像窗口。")
