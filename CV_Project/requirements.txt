@@ -1,24 +1,6 @@
-# requirements.txt
-
-# 核心深度学习框架
 torch
 torchvision
-# torchaudio # 如果你的torchvision安装时自动包含了它，或者未来可能用到音频，可以保留
-
-# 数据处理和科学计算
 numpy
-pandas # 用于读取 class_dict.csv
-
-# 图像处理
-Pillow # PIL (Python Imaging Library) 的一个fork，用于图像文件的打开和基本操作
-
-# 可视化
 matplotlib
-
-# 进度条
 tqdm
-
-
-jupyterlab
-notebook
-ipykernel
+Pillow 

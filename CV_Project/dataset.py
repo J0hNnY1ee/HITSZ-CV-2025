@@ -1,226 +1,216 @@
-# dataset.py
-
+# ==============================================================================
+# 模块导入 (IMPORTS)
+# ==============================================================================
 import torch
-import torchvision.transforms as T
-from torchvision.datasets import VOCSegmentation
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image
-import numpy as np
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import torchvision.transforms.functional as TF # 用于同步变换
 import os
+import random
+from PIL import Image # 用于类型提示和检查
+import matplotlib.pyplot as plt
 
-# --------------------------------------------------------------------------------
-# 0. 定义一些常量和辅助数据
-# --------------------------------------------------------------------------------
+# ==============================================================================
+# 全局常量 (GLOBAL CONSTANTS)
+# ==============================================================================
+VOC_CLASSES = [
+    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
+    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike',
+    'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
 
-NUM_CLASSES = 21  # 20 物体类别 + 1 背景
-IMG_WIDTH = 256
-IMG_HEIGHT = 256
-
-# (R, G, B) for PASCAL VOC
 VOC_COLORMAP = [
     [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0], [0, 0, 128],
     [128, 0, 128], [0, 128, 128], [128, 128, 128], [64, 0, 0], [192, 0, 0],
-    [64, 128, 0], [192, 128, 0], [64, 0, 128], [192, 0, 128],
-    [64, 128, 128], [192, 128, 128], [0, 64, 0], [128, 64, 0],
-    [0, 192, 0], [128, 192, 0], [0, 64, 128]
-]
-VOC_CLASSES = [
-    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus",
-    "car", "cat", "chair", "cow", "diningtable", "dog", "horse",
-    "motorbike", "person", "potted plant", "sheep", "sofa", "train",
-    "tv/monitor"
+    [64, 128, 0], [192, 128, 0], [64, 0, 128], [192, 0, 128], [64, 128, 128],
+    [192, 128, 128], [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
+    [0, 64, 128]
 ]
 
-# ImageNet 均值和标准差
-normalize_mean = [0.485, 0.456, 0.406]
-normalize_std = [0.229, 0.224, 0.225]
-
-# --------------------------------------------------------------------------------
-# 1. 定义数据转换
-# --------------------------------------------------------------------------------
-
-def get_transform_image(img_height=IMG_HEIGHT, img_width=IMG_WIDTH):
-    return T.Compose([
-        T.Resize((img_height, img_width)),
-        T.ToTensor(),
-        T.Normalize(mean=normalize_mean, std=normalize_std)
-    ])
-
-def get_transform_mask(img_height=IMG_HEIGHT, img_width=IMG_WIDTH):
-    return T.Compose([
-        T.Resize((img_height, img_width), interpolation=T.InterpolationMode.NEAREST),
-        T.Lambda(lambda x: torch.tensor(np.array(x), dtype=torch.long))
-    ])
-
-# --------------------------------------------------------------------------------
-# 2. 自定义 Dataset 类
-# --------------------------------------------------------------------------------
-
-class PascalVOCDataset(Dataset):
-    def __init__(self, root, image_set='train', download=False, 
-                 img_height=IMG_HEIGHT, img_width=IMG_WIDTH,
-                 transform_img=None, transform_msk=None):
-        self.voc_dataset = VOCSegmentation(root=root, year='2012', image_set=image_set, download=download)
-        
-        self.transform_img = transform_img if transform_img else get_transform_image(img_height, img_width)
-        self.transform_msk = transform_msk if transform_msk else get_transform_mask(img_height, img_width)
-        
-        # 进一步处理掩码中的边界值 (255)
-        # PASCAL VOC 掩码中的边界像素值为255。
-        # 我们通常将其视为背景(0)或在损失函数中通过 ignore_index 忽略。
-        # 这里我们选择将其映射到0 (背景类别)，这样我们的类别索引就是 0 到 NUM_CLASSES-1。
-        # 如果损失函数设置了 ignore_index=255，则无需此步骤。
-        # 但为了统一，这里处理掉。
-        self.map_255_to_0 = True 
-        # 或者，如果你想在损失函数中忽略255 (例如，如果某些模型或损失函数默认处理255)
-        # self.ignore_index = 255 
-        # self.map_255_to_0 = False
-
-    def __len__(self):
-        return len(self.voc_dataset)
-
-    def __getitem__(self, idx):
-        img, mask_pil = self.voc_dataset[idx] # img 和 mask_pil 都是 PIL Image
-
-        img_tensor = self.transform_img(img)
-        mask_tensor = self.transform_msk(mask_pil)
-            
-        if self.map_255_to_0:
-            mask_tensor[mask_tensor == 255] = 0 # 将边界 (255) 映射到背景 (0)
-            
-        return img_tensor, mask_tensor
-
-# --------------------------------------------------------------------------------
-# 3. 获取 DataLoaders 的辅助函数
-# --------------------------------------------------------------------------------
-
-def get_dataloaders(data_root='./data', batch_size=8, num_workers=2, 
-                    img_height=IMG_HEIGHT, img_width=IMG_WIDTH, download_data=True):
+# ==============================================================================
+# 同步变换类 (SYNCHRONIZED TRANSFORMS CLASS)
+# ==============================================================================
+class SynchronizedTransform:
     """
-    准备 PASCAL VOC 2012 的训练和验证 DataLoader。
+    对图像和掩码应用同步的几何变换，以及各自的非几何变换。
+    设计用于 torchvision.datasets.VOCSegmentation 的 'transforms' (复数) 参数。
     """
-    os.makedirs(data_root, exist_ok=True)
+    def __init__(self, image_size, is_train=True):
+        self.image_size = image_size if isinstance(image_size, tuple) else (image_size, image_size)
+        self.is_train = is_train
 
-    try:
-        train_dataset = PascalVOCDataset(root=data_root, image_set='train', download=download_data,
-                                         img_height=img_height, img_width=img_width)
-        val_dataset = PascalVOCDataset(root=data_root, image_set='val', download=download_data,
-                                       img_height=img_height, img_width=img_width)
+        # 图像的非几何变换
+        self.image_normalization = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        # 掩码的非几何变换 (P模式PIL转Tensor)
+        self.mask_to_tensor = transforms.ToTensor()
+
+    def __call__(self, image: Image.Image, mask: Image.Image):
+        # --- 1. 同步几何变换 (应用于 PIL Image) ---
+        # 统一缩放 (对于验证/测试集，或训练集增强前)
+        if not self.is_train: # 验证或测试
+            image = TF.resize(image, self.image_size, interpolation=transforms.InterpolationMode.BILINEAR)
+            mask = TF.resize(mask, self.image_size, interpolation=transforms.InterpolationMode.NEAREST)
+        else: # 训练时的数据增强
+            # 随机缩放裁剪
+            # get_params 方法用于生成随机参数，然后分别应用于图像和掩码
+            scale_range = (0.5, 2.0) # 缩放范围
+            ratio_range = (3. / 4., 4. / 3.) # 高宽比范围
+            i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=scale_range, ratio=ratio_range)
+            image = TF.resized_crop(image, i, j, h, w, self.image_size, interpolation=transforms.InterpolationMode.BILINEAR)
+            mask = TF.resized_crop(mask, i, j, h, w, self.image_size, interpolation=transforms.InterpolationMode.NEAREST)
+
+            # 随机水平翻转
+            if random.random() > 0.5:
+                image = TF.hflip(image)
+                mask = TF.hflip(mask)
         
-        print(f"Successfully loaded datasets.")
-        print(f"Training dataset size: {len(train_dataset)}")
-        print(f"Validation dataset size: {len(val_dataset)}")
+        # --- 2. 图像特有的非几何变换 (应用于 PIL Image) ---
+        if self.is_train:
+            # 随机颜色抖动 (仅对图像)
+            color_jitter = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1)
+            image = color_jitter(image)
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                                  num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
-                                num_workers=num_workers, pin_memory=True)
+        # --- 3. 转换为 Tensor 并进行归一化 ---
+        image_tensor = self.image_normalization(image)
         
-        print(f"DataLoaders created with batch size: {batch_size}")
-        return train_loader, val_loader
+        # 对于P模式的PIL掩码，ToTensor会将其转换为 (1, H, W) 的 LongTensor，值保持原始类别索引
+        # 如果掩码是L模式，ToTensor会缩放到[0,1]，这不是我们想要的。VOC的掩码是P模式。
+        mask_tensor = self.mask_to_tensor(mask) # 输出 (1, H, W), dtype=torch.float32, 但值是整数索引
 
-    except RuntimeError as e:
-        print(f"Error loading dataset or creating DataLoaders: {e}")
-        print("Please ensure you have a stable internet connection or the dataset is already downloaded and correctly placed.")
-        print("If you are on a restricted network, you might need to download the dataset manually from:")
-        print("http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar")
-        print("And place it in the 'data' directory (or the specified data_root), then extract it.")
-        return None, None
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return None, None
+        return image_tensor, mask_tensor
 
-# --------------------------------------------------------------------------------
-# 4. 可视化辅助函数 (可以保留在这里，方便在其他地方调用)
-# --------------------------------------------------------------------------------
-def denormalize(tensor, mean=normalize_mean, std=normalize_std):
-    # 确保 mean 和 std 是 tensor 并且形状正确
-    if not isinstance(mean, torch.Tensor):
-        mean = torch.tensor(mean)
-    if not isinstance(std, torch.Tensor):
-        std = torch.tensor(std)
+
+# ==============================================================================
+# 数据加载器函数 (DATALOADER FUNCTION)
+# ==============================================================================
+def get_voc_dataloaders(data_root, batch_size, image_size=(256, 256), num_workers=4):
+    """
+    获取 PASCAL VOC 2012 数据集的 DataLoader，包含训练时的数据增强。
+
+    参数:
+        data_root (str): 数据集存放的根目录。
+        batch_size (int): 批处理大小。
+        image_size (tuple or int): 图像和掩码统一调整到的大小 (height, width)。
+        num_workers (int): 数据加载的子进程数量。
+
+    返回:
+        train_loader (DataLoader): 训练集 DataLoader。
+        val_loader (DataLoader): 验证集 DataLoader。
+        num_classes (int): 类别数量 (包括背景)。
+    """
+    # --- 为训练集和验证集定义同步变换 ---
+    train_transforms = SynchronizedTransform(image_size, is_train=True)
+    val_transforms = SynchronizedTransform(image_size, is_train=False)
+
+    # --- 创建训练集 ---
+    # download=True 如果数据集不存在，会自动下载
+    # 'transforms' (复数) 参数接收一个可调用对象，该对象处理 (image, target) 对
+    train_dataset = datasets.VOCSegmentation(
+        root=data_root,
+        year='2012',
+        image_set='train',
+        download=True,
+        transforms=train_transforms # 使用同步变换
+    )
+
+    # --- 创建验证集 ---
+    val_dataset = datasets.VOCSegmentation(
+        root=data_root,
+        year='2012',
+        image_set='val',
+        download=True,
+        transforms=val_transforms # 使用同步变换
+    )
+
+    # --- 创建 DataLoader ---
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True, # 如果GPU可用，这可以加速数据传输
+        drop_last=True   # 训练时可以丢弃最后一个不完整的批次
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size, # 验证时batch_size可以设大一些如果显存允许
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
-    # 调整形状以进行广播
-    if tensor.ndim == 4: # Batch of images [B, C, H, W]
-        mean = mean.view(1, -1, 1, 1).to(tensor.device)
-        std = std.view(1, -1, 1, 1).to(tensor.device)
-    elif tensor.ndim == 3: # Single image [C, H, W]
-        mean = mean.view(-1, 1, 1).to(tensor.device)
-        std = std.view(-1, 1, 1).to(tensor.device)
-    else:
-        raise ValueError("Input tensor must have 3 or 4 dimensions")
-        
-    return tensor * std + mean
+    num_classes = len(VOC_CLASSES) # 21 类
 
-def tensor_to_pil(tensor_image, mean=normalize_mean, std=normalize_std):
-    """将归一化后的图像Tensor转换为PIL Image (用于显示)"""
-    if tensor_image.ndim == 4: # 如果是 [B, C, H, W]，取第一张
-        tensor_image = tensor_image[0]
-    
-    denorm_image = denormalize(tensor_image.cpu(), mean, std)
-    pil_image = T.ToPILImage()(denorm_image.clamp(0, 1)) # clamp确保值在[0,1]
-    return pil_image
+    print(f"数据集信息:")
+    print(f"  训练集样本数: {len(train_dataset)}")
+    print(f"  验证集样本数: {len(val_dataset)}")
+    print(f"  类别数量: {num_classes}")
 
-def mask_to_pil_color(mask_tensor, colormap=VOC_COLORMAP):
-    """将类别索引的mask Tensor转换为彩色的PIL Image"""
-    if mask_tensor.ndim == 3 and mask_tensor.shape[0] == 1: # [1, H, W] -> [H, W]
-        mask_tensor = mask_tensor.squeeze(0)
-    
-    if mask_tensor.ndim != 2:
-        raise ValueError(f"Mask tensor must be 2D (H, W) or 3D (1, H, W), got {mask_tensor.shape}")
-
-    mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
-    colored_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
-    
-    for r in range(mask_np.shape[0]):
-        for c in range(mask_np.shape[1]):
-            class_idx = mask_np[r, c]
-            if class_idx < len(colormap):
-                colored_mask[r, c, :] = colormap[class_idx]
-            # elif class_idx == 255 and 0 < len(colormap): # 如果255被映射到了背景
-            #     colored_mask[r, c, :] = colormap[0] 
-    
-    return Image.fromarray(colored_mask)
+    return train_loader, val_loader, num_classes
 
 
-# --------------------------------------------------------------------------------
-# 5. (可选) 主程序块，用于测试 dataset.py 是否能独立运行并加载数据
-# --------------------------------------------------------------------------------
+# ==============================================================================
+# 主执行块 (测试用) (MAIN EXECUTION BLOCK - FOR TESTING)
+# ==============================================================================
 if __name__ == '__main__':
-    import matplotlib.pyplot as plt
+    DATA_ROOT = './data_voc' # 测试用的数据路径
+    BATCH_SIZE = 2
+    IMAGE_SIZE = (256, 256)
 
-    print("Testing dataset.py...")
+    if not os.path.exists(DATA_ROOT):
+        os.makedirs(DATA_ROOT)
+
+    print("开始测试数据集加载...")
+    train_loader_test, val_loader_test, num_classes_test = get_voc_dataloaders(
+        DATA_ROOT, BATCH_SIZE, IMAGE_SIZE, num_workers=0 # 测试时num_workers设为0方便调试
+    )
+
+    print("\n测试训练数据加载器:")
+    images_train, masks_train = next(iter(train_loader_test))
+    print(f"  图像批次形状: {images_train.shape}") # 期望 (B, 3, H, W)
+    print(f"  掩码批次形状: {masks_train.shape}")   # 期望 (B, 1, H, W) from ToTensor on P-mode PIL
+    print(f"  图像数据类型: {images_train.dtype}")
+    print(f"  掩码数据类型: {masks_train.dtype}")   # 应该是 torch.float32，但值是整数
     
-    # 测试获取 dataloaders
-    train_loader, val_loader = get_dataloaders(batch_size=4, download_data=True)
+    # 掩码处理： squeeze(1) 移除通道维度，.long() 转换为长整型用于损失计算
+    masks_train_for_loss = masks_train.squeeze(1).long()
+    print(f"  用于损失计算的训练掩码形状: {masks_train_for_loss.shape}") # 期望 (B, H, W)
+    print(f"  用于损失计算的训练掩码数据类型: {masks_train_for_loss.dtype}") # 期望 torch.int64
+    unique_train_mask_values = torch.unique(masks_train_for_loss)
+    print(f"  训练掩码中的唯一值: {unique_train_mask_values}")
+    if 255 in unique_train_mask_values:
+        print("  训练掩码中包含255 (忽略标签)。")
 
-    if train_loader and val_loader:
-        print("\nVisualizing a sample from training data using matplotlib...")
-        try:
-            sample_images, sample_masks = next(iter(train_loader))
-            
-            idx_to_show = 0
-            img_to_show_pil = tensor_to_pil(sample_images[idx_to_show])
-            mask_to_show_pil = mask_to_pil_color(sample_masks[idx_to_show])
 
-            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-            axes[0].imshow(img_to_show_pil)
-            axes[0].set_title(f"Sample Image (Index {idx_to_show})")
-            axes[0].axis('off')
+    print("\n测试验证数据加载器:")
+    images_val, masks_val = next(iter(val_loader_test))
+    print(f"  图像批次形状: {images_val.shape}")
+    print(f"  掩码批次形状: {masks_val.shape}")
+    masks_val_for_loss = masks_val.squeeze(1).long()
+    unique_val_mask_values = torch.unique(masks_val_for_loss)
+    print(f"  验证掩码中的唯一值: {unique_val_mask_values}")
 
-            axes[1].imshow(mask_to_show_pil)
-            axes[1].set_title(f"Sample Mask (Index {idx_to_show})")
-            axes[1].axis('off')
-            
-            plt.tight_layout()
-            plt.show()
 
-            print(f"Image tensor shape: {sample_images[idx_to_show].shape}")
-            print(f"Mask tensor shape: {sample_masks[idx_to_show].shape}")
-            print(f"Mask tensor dtype: {sample_masks[idx_to_show].dtype}")
-            print(f"Unique values in displayed mask: {torch.unique(sample_masks[idx_to_show])}")
+    print("\n数据集加载测试完成。")
 
-        except Exception as e:
-            print(f"Error during visualization test: {e}")
-    else:
-        print("Could not test visualization as DataLoaders were not created.")
+    sample_img_tensor = images_train[0]
+    sample_mask_tensor = masks_train_for_loss[0]
+    inv_normalize = transforms.Normalize(
+       mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+       std=[1/0.229, 1/0.224, 1/0.225]
+    )
+    sample_img_pil = transforms.ToPILImage()(inv_normalize(sample_img_tensor.cpu()))
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.imshow(sample_img_pil)
+    plt.title("增强后的图像样本")
+    plt.axis('off')
+    plt.subplot(1, 2, 2)
+    plt.imshow(sample_mask_tensor.cpu().numpy(), cmap='tab20', vmin=0, vmax=20) # tab20 有20种颜色
+    plt.title("增强后的掩码样本")
+    plt.axis('off')
+    plt.show()
