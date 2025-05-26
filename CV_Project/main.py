@@ -36,8 +36,6 @@ def parse_args():
     parser.add_argument('--img_width', type=int, default=224, help="输入图像的宽度")
     parser.add_argument('--batch_size', type=int, default=4, help="批次大小")
     parser.add_argument('--num_workers', type=int, default=2, help="数据加载器工作线程数")
-    parser.add_argument('--use_data_augmentation', action='store_true', default=False,
-                        help="是否对训练集使用数据增强 (注意: 当前版本仅对图像应用几何变换)")
 
     # --- 模型参数 ---
     parser.add_argument('--model_name', type=str, default='simple',
@@ -115,22 +113,8 @@ def main():
         T.Resize((args.img_height, args.img_width), interpolation=T.InterpolationMode.NEAREST)
     ]
 
-    if args.use_data_augmentation:
-        print("  训练集将使用数据增强。")
-        print("  注意: 当前版本的数据增强中，几何变换(如RandomHorizontalFlip)仅应用于图像，未同步到掩码。")
-        print("         颜色相关的增强(如ColorJitter, GaussianBlur)仅应用于图像。")
-        # 定义只针对图像的PIL级增强 (颜色类 + 几何类，几何类仅作用于图像)
-        train_image_augmentations = [
-            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-            T.GaussianBlur(kernel_size=(3,5), sigma=(0.1,1.0)),
-            T.RandomHorizontalFlip(p=0.5), # 只作用于图像
-        ]
-        train_image_transform = T.Compose(train_image_augmentations + common_image_transforms_list)
-        train_target_transform = T.Compose(common_target_transforms_list) # 目标只进行Resize
-    else:
-        print("  训练集将不使用额外的数据增强 (除了Resize, ToTensor, Normalize)。")
-        train_image_transform = T.Compose(common_image_transforms_list)
-        train_target_transform = T.Compose(common_target_transforms_list)
+    train_image_transform = T.Compose(common_image_transforms_list)
+    train_target_transform = T.Compose(common_target_transforms_list)
 
     # 验证/测试集的变换 (不包含随机增强)
     eval_image_transform = T.Compose(common_image_transforms_list)
@@ -169,15 +153,6 @@ def main():
     num_output_classes = train_dataset.num_total_classes
     num_classes_for_eval = train_dataset.num_total_classes # 评估时混淆矩阵的维度
     ignore_index_actual = train_dataset.ignore_index      # 实际的忽略索引，用于损失和评估
-
-    # 如果ignore_index是有效类别（例如0-10），但模型输出11类（0-10），
-    # 评估时的num_classes_for_eval应为11。
-    # 如果ignore_index是11，模型输出11类（0-10），num_classes_for_eval=11，
-    # 那么evaluate_segmentation中_fast_hist的mask (label_true < num_classes)会把11排除。
-    # 如果ignore_index是11，模型输出12类（0-11），num_classes_for_eval=12，
-    # 那么evaluate_segmentation中的ignore_index参数(值为11)会用于调整后的mIoU计算。
-    # 当前设定：num_output_classes 和 num_classes_for_eval 都等于数据集中的总类别数。
-    # ignore_index_actual 是从数据集中获取的，用于损失和评估时的忽略。
 
     if num_output_classes <= 0: print("错误: 从数据集中获取的总类别数无效。"); return
     if ignore_index_actual == -1 : print("警告: 数据集未指定明确的 ignore_index (-1)。")
