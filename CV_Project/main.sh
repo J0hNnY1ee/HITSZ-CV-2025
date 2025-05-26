@@ -44,11 +44,11 @@ python main.py --model_name UNet --camvid_root_dir CamVid \
 python main.py --data_root CamVid \
                --model_name segnet \
                --img_height 224 --img_width 224 \
-               --epochs 50 \
+               --epochs 200 \
                --batch_size 32 \
                --lr 0.001 \
                --optimizer adam \
                --scheduler_step_size 30 \
                --output_base_dir ./results/segnet \
-               --experiment_name segnet_run50 \
+               --experiment_name segnet_run200 \
                --evaluate_on_test
