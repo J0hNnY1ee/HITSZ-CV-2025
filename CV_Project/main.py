@@ -7,8 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
-# import torchvision.transforms.functional as TF # 用于同步变换 (在此版本main.py中未直接使用TF进行同步)
-# import random # 用于随机性 (在此版本main.py中未直接用于同步变换)
 import datetime
 import json
 import numpy as np
@@ -48,14 +46,7 @@ def parse_args():
     parser.add_argument('--deeplab_encoder_layers', type=int, nargs='+', default=[2,2,2,2], help="DeepLabV3+ CustomResNetEncoder块数量")
     parser.add_argument('--deeplab_aspp_out_channels', type=int, default=256, help="ASPP模块输出通道数")
     parser.add_argument('--deeplab_decoder_channels', type=int, default=256, help="DeepLabV3+解码器中间通道数")
-    parser.add_argument('--segformer_embed_dims', type=int, nargs='+', default=[32, 64, 160, 256], help="SegFormer各阶段embedding维度")
-    parser.add_argument('--segformer_num_heads', type=int, nargs='+', default=[1, 2, 5, 8], help="SegFormer各阶段注意力头数")
-    parser.add_argument('--segformer_mlp_ratios', type=int, nargs='+', default=[4, 4, 4, 4], help="SegFormer各阶段MLP扩展比率")
-    parser.add_argument('--segformer_depths', type=int, nargs='+', default=[2, 2, 2, 2], help="SegFormer各阶段Transformer层数")
-    parser.add_argument('--segformer_patch_sizes', type=int, nargs='+', default=[4, 2, 2, 2], help="SegFormer各阶段patch_embed的步幅/尺寸")
-    parser.add_argument('--segformer_decoder_hidden_dim', type=int, default=256, help="SegFormer解码器MLP隐藏层维度")
-    parser.add_argument('--segformer_drop_rate', type=float, default=0.1, help="SegFormer中的dropout率")
-    parser.add_argument('--segnet_bn_momentum', type=float, default=0.1, help="SegNet中BatchNorm的momentum")
+
 
     # --- 训练参数 ---
     parser.add_argument('--epochs', type=int, default=100, help="总训练轮数")
@@ -71,19 +62,6 @@ def parse_args():
     parser.add_argument('--evaluate_on_test', action='store_true', default=False, help="训练结束后在测试集上评估最佳模型")
     args = parser.parse_args()
 
-    if args.model_name.lower() == 'segformer_simple':
-        segformer_list_param_names = ['segformer_embed_dims', 'segformer_num_heads', 'segformer_mlp_ratios', 'segformer_depths', 'segformer_patch_sizes']
-        segformer_list_args_values = [getattr(args, name) for name in segformer_list_param_names]
-        if segformer_list_args_values:
-            it = iter(segformer_list_args_values)
-            try:
-                the_len = len(next(it))
-                if not all(len(l) == the_len for l in it):
-                    param_details = "\n".join([f"  {name}: length {len(getattr(args, name))}" for name in segformer_list_param_names])
-                    raise ValueError(f'所有 segformer_* 列表参数的长度必须一致。当前长度:\n{param_details}')
-                if the_len == 0: raise ValueError('SegFormer参数列表不能为空。')
-            except StopIteration:
-                if len(segformer_list_args_values[0]) == 0: raise ValueError('SegFormer参数列表不能为空。')
     return args
 
 def main():
@@ -121,10 +99,7 @@ def main():
     eval_target_transform = T.Compose(common_target_transforms_list)
 
     try:
-        # CamVidDataset 构造函数中的 output_size 参数可以用于内部resize，
-        # 如果使用 output_size, 则外部 transform 中通常不需要再包含 Resize。
-        # 这里我们选择在外部 transform 中进行 Resize (通过 common_..._transforms_list)
-        # 所以 CamVidDataset 的 output_size 参数将为 None (默认)。
+
         train_dataset = CamVidDataset(
             root_dir=args.data_root, image_set='train',
             transform=train_image_transform,
@@ -180,10 +155,7 @@ def main():
     else: raise ValueError(f"不支持的模型名称: {args.model_name}.")
     model.to(device)
 
-    # CrossEntropyLoss的ignore_index: 如果数据集提供了有效的ignore_index (>=0), 则使用它。
-    # 否则，如果数据集的ignore_index是-1 (表示无特定忽略类或所有类都重要),
-    # 那么loss的ignore_index应设为PyTorch的默认值-100 (或不设置，让PyTorch处理)。
-    # 这里我们统一：如果数据集的ignore_index是-1，则loss用-100。否则用数据集的ignore_index。
+
     criterion_ignore_idx = ignore_index_actual if ignore_index_actual != -1 else -100
     criterion = nn.CrossEntropyLoss(ignore_index=criterion_ignore_idx)
     print(f"  损失函数: CrossEntropyLoss (ignore_index={criterion_ignore_idx})")

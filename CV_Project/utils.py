@@ -106,7 +106,7 @@ def save_dict_to_json(data_dict: dict, json_path: str):
     except Exception as e: print(f"保存字典到 {json_path} 时出错: {e}")
 
 # ==============================================================================
-# 新增：绘制和保存训练历史图表
+# 绘制和保存训练历史图表
 # ==============================================================================
 def plot_and_save_history(history: dict, save_path_prefix: str, primary_metric_name: str = "mIoU"):
     """
@@ -163,87 +163,3 @@ def plot_and_save_history(history: dict, save_path_prefix: str, primary_metric_n
         except Exception as e:
             print(f"绘制{primary_metric_name}曲线图时出错: {e}")
 
-
-# ==============================================================================
-# 测试代码 (可选)
-# ==============================================================================
-if __name__ == '__main__':
-    print("开始 utils.py 测试...")
-
-    # --- 测试 set_seed ---
-    print("\n测试 set_seed...")
-    set_seed(123)
-    val1_np = np.random.rand()
-    val1_torch = torch.rand(1).item()
-    set_seed(123)
-    val2_np = np.random.rand()
-    val2_torch = torch.rand(1).item()
-    assert val1_np == val2_np, "NumPy 随机种子设置失败"
-    assert val1_torch == val2_torch, "PyTorch 随机种子设置失败"
-    print("set_seed 测试通过。")
-
-    # --- 测试检查点函数 (模拟) ---
-    print("\n测试检查点函数...")
-    class DummyModel(torch.nn.Module):
-        def __init__(self): super().__init__(); self.linear = torch.nn.Linear(10, 2)
-        def forward(self, x): return self.linear(x)
-
-    model = DummyModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    # 模拟一个实验目录
-    temp_experiment_dir = "temp_utils_experiment"
-    os.makedirs(temp_experiment_dir, exist_ok=True)
-
-    state_to_save = {
-        'epoch': 5, 'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'best_metric_val': 0.75, 'metric_name': 'test_mIoU'
-    }
-    save_checkpoint(state_to_save, is_best=True, experiment_dir=temp_experiment_dir, filename_prefix="test_model")
-
-    new_model = DummyModel()
-    new_optimizer = torch.optim.Adam(new_model.parameters(), lr=0.001)
-    new_scheduler = torch.optim.lr_scheduler.StepLR(new_optimizer, step_size=5, gamma=0.1)
-    checkpoint_file = os.path.join(temp_experiment_dir, "test_model_best.pth.tar")
-    if os.path.exists(checkpoint_file):
-        loaded_epoch, loaded_metric = load_checkpoint(checkpoint_file, new_model, new_optimizer, new_scheduler)
-        assert loaded_epoch == 5, f"加载的epoch不匹配: 期望5, 得到{loaded_epoch}"
-        assert loaded_metric == 0.75, f"加载的指标不匹配: 期望0.75, 得到{loaded_metric}"
-        print("检查点加载和参数恢复的基本测试通过。")
-    else:
-        print(f"错误: 未找到期望的检查点文件 {checkpoint_file}，跳过加载测试。")
-    if os.path.exists(temp_experiment_dir):
-        import shutil; shutil.rmtree(temp_experiment_dir)
-        print(f"临时实验目录 {temp_experiment_dir} 已删除。")
-
-    # --- 测试掩码可视化 ---
-    # (与之前版本相同，可以保留)
-    print("\n测试掩码可视化函数...")
-    test_palette_inverse = {0: (128, 128, 128), 1: (128, 0, 0), 11: (0, 0, 0)}
-    mask_data = torch.tensor([[0, 1, 0, 11], [1, 1, 0, 0], [11, 0, 1, 11]], dtype=torch.long)
-    pil_rgb_image = tensor_mask_to_pil_rgb(mask_data, test_palette_inverse)
-    assert pil_rgb_image.mode == "RGB", "输出图像模式应为RGB"
-    print("掩码可视化函数测试通过。")
-
-    # --- 测试 save_dict_to_json ---
-    print("\n测试 save_dict_to_json...")
-    test_dict_data = {
-        "name": "test_experiment", "value": 123.45,
-        "metrics": {"iou": np.array([0.5, 0.6]), "loss": torch.tensor(0.123)},
-        "is_valid": True, "nested": {"a":1, "b": [1,2,3]}
-    }
-    json_test_path = "temp_test_dict.json"
-    save_dict_to_json(test_dict_data, json_test_path)
-    assert os.path.exists(json_test_path), f"{json_test_path} 未创建"
-    with open(json_test_path, 'r') as f_read:
-        loaded_json_data = json.load(f_read)
-    assert loaded_json_data["name"] == "test_experiment"
-    assert loaded_json_data["metrics"]["iou"] == [0.5, 0.6] # NumPy array converted to list
-    print("save_dict_to_json 测试通过。")
-    if os.path.exists(json_test_path):
-        os.remove(json_test_path)
-
-
-    print("\nutils.py 测试结束。")
